@@ -3,7 +3,7 @@ Copyright 2022 The Kubernetes Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-   http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,16 +21,17 @@ import (
 	"slices"
 
 	v1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	evictionutils "sigs.k8s.io/descheduler/pkg/descheduler/evictions/utils"
-
 	nodeutil "sigs.k8s.io/descheduler/pkg/descheduler/node"
 	podutil "sigs.k8s.io/descheduler/pkg/descheduler/pod"
 	frameworktypes "sigs.k8s.io/descheduler/pkg/framework/types"
@@ -164,7 +165,6 @@ func applyEffectivePodProtections(d *DefaultEvictor, podProtections []PodProtect
 	applyDaemonSetPodsProtection(d, protectionMap)
 	applyPVCPodsProtection(d, protectionMap)
 	applyPodsWithoutPDBProtection(d, protectionMap, handle)
-	applyPodsWithPDBBlockingSingleReplicaOwnerProtection(d, protectionMap, handle)
 	applyPodsWithResourceClaimsProtection(d, protectionMap)
 
 	return nil
@@ -363,73 +363,6 @@ func applyPodsWithoutPDBProtection(d *DefaultEvictor, protectionMap map[PodProte
 	}
 }
 
-func applyPodsWithPDBBlockingSingleReplicaOwnerProtection(d *DefaultEvictor, protectionMap map[PodProtection]bool, handle frameworktypes.Handle) {
-	// This setting causes pods with PDBs to be evictable when their owner has only 1 replica.
-	// When this protection is in ExtraEnabled, pods from single-replica deployments with PDBs
-	// are treated as candidates for eviction (not protected).
-	// When not enabled, the PDB still acts as a barrier at the API server level.
-	isSettingEnabled := protectionMap[PodsWithPDBBlockingSingleReplicaOwner]
-	if !isSettingEnabled {
-		return
-	}
-
-	// Add constraint that allows eviction of single-replica PDB-protected pods
-	d.constraints = append(d.constraints, func(pod *v1.Pod) error {
-		// Check if pod is covered by a PDB
-		hasPdb, err := utils.IsPodCoveredByPDB(pod, handle.SharedInformerFactory().Policy().V1().PodDisruptionBudgets().Lister())
-		if err != nil {
-			return fmt.Errorf("unable to check if pod is covered by PodDisruptionBudget: %w", err)
-		}
-
-		if !hasPdb {
-			// No PDB, pass through
-			return nil
-		}
-
-		// Pod has a PDB. Check if its owner has only 1 replica.
-		ownerRefs := podutil.OwnerRef(pod)
-		if len(ownerRefs) == 0 {
-			// Pod has no owner, protect it from eviction due to PDB
-			return fmt.Errorf("pod is covered by PodDisruptionBudget")
-		}
-
-		// For each owner, check if it's a single-replica workload
-		for _, ownerRef := range ownerRefs {
-			ownerObj, err := getOwnerObject(ownerRef, pod.Namespace, handle)
-			if err != nil {
-				// Unable to get owner, protect the pod
-				return fmt.Errorf("unable to determine if pod's owner is single-replica, protecting due to PDB: %w", err)
-			}
-
-			// If owner has single replica, allow eviction (return nil)
-			if ownerObj != nil && utils.OwnerHasSingleReplica(ownerRefs, ownerObj) {
-				// Single replica owner with PDB - we allow eviction
-				return nil
-			}
-		}
-
-		// Multi-replica owner with PDB - protect from eviction
-		return fmt.Errorf("pod is covered by PodDisruptionBudget")
-	})
-}
-
-// getOwnerObject retrieves the owner object from the appropriate informer based on the owner kind
-func getOwnerObject(ownerRef metav1.OwnerReference, namespace string, handle frameworktypes.Handle) (interface{}, error) {
-	switch ownerRef.Kind {
-	case "Deployment":
-		return handle.SharedInformerFactory().Apps().V1().Deployments().Lister().Deployments(namespace).Get(ownerRef.Name)
-	case "StatefulSet":
-		return handle.SharedInformerFactory().Apps().V1().StatefulSets().Lister().StatefulSets(namespace).Get(ownerRef.Name)
-	case "ReplicaSet":
-		return handle.SharedInformerFactory().Apps().V1().ReplicaSets().Lister().ReplicaSets(namespace).Get(ownerRef.Name)
-	case "DaemonSet":
-		// DaemonSets are never single-replica in the traditional sense
-		return nil, nil
-	default:
-		return nil, fmt.Errorf("unsupported owner kind: %s", ownerRef.Kind)
-	}
-}
-
 func applyPodsWithResourceClaimsProtection(d *DefaultEvictor, protectionMap map[PodProtection]bool) {
 	isProtectionEnabled := protectionMap[PodsWithResourceClaims]
 	if isProtectionEnabled {
@@ -607,7 +540,96 @@ func getPodIndexerByOwnerRefs(indexName string, handle frameworktypes.Handle) (c
 	}); err != nil {
 		return nil, err
 	}
+
 	return indexer, nil
+}
+
+// PDB action types
+const (
+	PDBActionDelete = "delete"
+	PDBActionModify = "modify"
+	PDBActionNone   = "none"
+)
+
+// shouldHandlePDB determines what action to take with a PDB to allow evictions during node drain
+// It returns (action, reason) where action is one of: "delete", "modify", or "none"
+func (d *DefaultEvictor) shouldHandlePDB(ctx context.Context, pdb *policyv1.PodDisruptionBudget, allPods, podsOnNode []*v1.Pod, logger klog.Logger) (string, string) {
+	if len(allPods) == 0 {
+		return PDBActionNone, "PDB has no pods"
+	}
+
+	// Scenario 1: Single-replica deployments - DELETE these PDBs (safe to delete)
+	// Check if ALL pods covered by this PDB are from single-replica deployments
+	// (not just pods on the current node - check all pods in allPods)
+	allAreSingleReplica := true
+	for _, pod := range allPods {
+		if !d.isSingleReplicaDeploymentPod(ctx, pod) {
+			allAreSingleReplica = false
+			break
+		}
+	}
+	if allAreSingleReplica && len(allPods) > 0 {
+		// For single-replica deployments, if the PDB has minAvailable: 1 and there's only
+		// 1 pod, the PDB is overly restrictive. For these, MODIFY instead of DELETE because:
+		// 1. Some operators (OTEL, Kyverno) auto-recreate deleted PDBs
+		// 2. Modifying allows temporary eviction during node drain
+		// 3. It's safer than deletion which might fail to recreate in time
+		if d.shouldModifyInsteadOfDelete(pdb) {
+			return PDBActionModify, "single-replica-deployment-restrictive"
+		}
+		// For non-restrictive single-replica PDBs, DELETE is safe because there's only 1 pod
+		return PDBActionDelete, "single-replica-deployment"
+	}
+
+	// Scenario 2: All pods of a PDB are on a single node - MODIFY PDB during node drain
+	// This handles cases like zone-specific gateways where all replicas for a zone happen to land on one node
+	// Only modify if there's more than 1 replica (single-replica PDBs are handled by scenario 1)
+	if len(podsOnNode) == len(allPods) && len(podsOnNode) > 1 {
+		return PDBActionModify, fmt.Sprintf("all-pods-on-target-node: PDB has no pods on other nodes")
+	}
+
+	// Scenario 3: Underreplicated deployment - when enabled, modify PDBs for deployments running
+	// at significantly reduced capacity compared to their configuration
+	if d.args.DeletePDBsForUnderreplicatedDeployments {
+		if isDeploymentUnderreplicated(allPods) {
+			return PDBActionModify, fmt.Sprintf("underreplicated-deployment: pods distributed poorly, enabling eviction")
+		}
+	}
+
+	// Scenario 4: Deployment running at minimum replica threshold - MODIFY PDB to allow draining
+	// If current pods equal minAvailable (or close to it), we're at the minimum and can't evict safely
+	// This prevents node drain from getting stuck on underreplicated applications
+	minRequired := calculateMinRequiredPods(pdb, len(allPods))
+	if len(allPods) <= minRequired {
+		return PDBActionModify, fmt.Sprintf("at-minimum-replicas: %d pods meet minimum requirement of %d, allowing eviction", len(allPods), minRequired)
+	}
+
+	// Scenario 5: Poorly distributed workload - all or nearly all pods concentrated on very few nodes
+	// Calculate which nodes have pods covered by this PDB
+	nodeDistribution := make(map[string]int)
+	for _, pod := range allPods {
+		nodeDistribution[pod.Spec.NodeName]++
+	}
+
+	// If pods are concentrated on 1-2 nodes out of many, the PDB isn't achieving distribution
+	// This covers zone-specific PDBs where all replicas ended up in the same zone
+	nodesWithPods := len(nodeDistribution)
+	if nodesWithPods <= 2 && len(allPods) > 2 {
+		// Calculate how concentrated the pods are
+		maxPodsOnSingleNode := 0
+		for _, count := range nodeDistribution {
+			if count > maxPodsOnSingleNode {
+				maxPodsOnSingleNode = count
+			}
+		}
+		// If >=80% of pods are on a single node, the PDB is failing to distribute
+		// Calculate: (maxPodsOnSingleNode * 100) >= (len(allPods) * 80)
+		if (maxPodsOnSingleNode * 100) >= (len(allPods) * 80) {
+			return PDBActionModify, fmt.Sprintf("poorly-distributed-across-nodes: %d/%d pods on %d nodes", len(podsOnNode), len(allPods), nodesWithPods)
+		}
+	}
+
+	return PDBActionNone, fmt.Sprintf("adequate-distribution: %d pods across %d nodes", len(allPods), nodesWithPods)
 }
 
 // isNamespaceExcludedFromNodeFit checks if a namespace is in the nodeFitExcludedNamespaces list
@@ -620,5 +642,245 @@ func (d *DefaultEvictor) isNamespaceExcludedFromNodeFit(namespace string) bool {
 			return true
 		}
 	}
+	return false
+}
+
+// calculateMinRequiredPods calculates the minimum number of pods that must remain available
+// based on the PDB's minAvailable and maxUnavailable constraints
+func calculateMinRequiredPods(pdb *policyv1.PodDisruptionBudget, totalPods int) int {
+	if pdb.Spec.MaxUnavailable != nil {
+		// maxUnavailable: how many can be unavailable
+		// minRequired = total - maxUnavailable
+		maxUnavailableVal := pdb.Spec.MaxUnavailable
+		intVal := maxUnavailableVal.IntValue()
+		return totalPods - intVal
+	}
+
+	if pdb.Spec.MinAvailable != nil {
+		// minAvailable: how many must remain available
+		minAvailableVal := pdb.Spec.MinAvailable
+		intVal := minAvailableVal.IntValue()
+		return intVal
+	}
+
+	// Default: at least 1 pod must remain (conservative default)
+	return 1
+}
+
+// isDeploymentUnderreplicated checks if a deployment appears to be running at reduced capacity
+// This is useful for identifying PDBs that are unnecessarily restrictive given actual distribution
+func isDeploymentUnderreplicated(pods []*v1.Pod) bool {
+	if len(pods) < 3 {
+		return false
+	}
+
+	// Count how many nodes the pods are spread across
+	nodeDistribution := make(map[string]int)
+	for _, pod := range pods {
+		nodeDistribution[pod.Spec.NodeName]++
+	}
+
+	// If very few pods are spread across multiple nodes (less than 2 per node on average),
+	// the deployment is likely underutilized or poorly distributed
+	nodesWithPods := len(nodeDistribution)
+	avgPodsPerNode := len(pods) / nodesWithPods
+
+	// Consider underreplicated if:
+	// - pods are spread across 3+ nodes but only 2-3 pods average per node
+	// - or pods are concentrated on very few nodes despite having replicas
+	return nodesWithPods >= 3 && avgPodsPerNode <= 2
+}
+
+// DeletePDBsForNode relaxes PodDisruptionBudgets to allow eviction during node drain
+// by either deleting them (for safe cases) or modifying them (for operator-managed PDBs).
+// For operator-managed PDBs (Kyverno, OTEL, etc), modification is preferred since they
+// auto-recreate if deleted. Only processes PDBs with pods on the target node to avoid
+// unnecessary cluster-wide checks.
+func (d *DefaultEvictor) DeletePDBsForNode(ctx context.Context, node *v1.Node, logger klog.Logger) {
+	if !d.args.DeletePDBsForSingleReplicaDeployments {
+		return
+	}
+
+	logger.V(1).Info("Starting PDB relaxation for single-replica deployments on node", "node", node.Name)
+
+	// List all PDBs in all namespaces
+	pdbList, err := d.handle.ClientSet().PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		logger.Error(err, "failed to list PodDisruptionBudgets")
+		return
+	}
+
+	if len(pdbList.Items) == 0 {
+		logger.V(2).Info("No PodDisruptionBudgets found")
+		return
+	}
+
+	logger.V(2).Info("Found PodDisruptionBudgets", "count", len(pdbList.Items))
+
+	relaxedCount := 0
+	for i := range pdbList.Items {
+		pdb := &pdbList.Items[i]
+		logger.V(3).Info("Checking PDB", "pdb", klog.KObj(pdb))
+
+		// Get pods covered by this PDB
+		pods, err := d.getPodsForPDB(ctx, pdb)
+		if err != nil {
+			logger.V(2).Error(err, "failed to get pods for PDB", "pdb", klog.KObj(pdb))
+			continue
+		}
+
+		if len(pods) == 0 {
+			logger.V(3).Info("PDB has no matching pods", "pdb", klog.KObj(pdb))
+			continue
+		}
+
+		// Filter pods to only those on the target node
+		var podsOnNode []*v1.Pod
+		for _, pod := range pods {
+			if pod.Spec.NodeName == node.Name {
+				podsOnNode = append(podsOnNode, pod)
+			}
+		}
+
+		if len(podsOnNode) == 0 {
+			logger.V(3).Info("PDB has no pods on target node", "pdb", klog.KObj(pdb), "node", node.Name)
+			continue
+		}
+
+		// Determine what action to take with this PDB
+		action, reason := d.shouldHandlePDB(ctx, pdb, pods, podsOnNode, logger)
+
+		switch action {
+		case PDBActionDelete:
+			if len(podsOnNode) > 0 {
+				logger.V(1).Info("Deleting PDB for single-replica deployment", "pdb", klog.KObj(pdb), "node", node.Name, "reason", reason, "podCount", len(podsOnNode))
+				err := d.handle.ClientSet().PolicyV1().PodDisruptionBudgets(pdb.Namespace).Delete(ctx, pdb.Name, metav1.DeleteOptions{})
+				if err != nil {
+					logger.Error(err, "failed to delete PDB", "pdb", klog.KObj(pdb))
+				} else {
+					logger.V(1).Info("Successfully deleted PDB", "pdb", klog.KObj(pdb))
+					relaxedCount++
+				}
+			}
+
+		case PDBActionModify:
+			if len(podsOnNode) > 0 {
+				logger.V(1).Info("Modifying PDB to allow evictions", "pdb", klog.KObj(pdb), "node", node.Name, "reason", reason, "podCount", len(podsOnNode))
+
+				// Create a copy and relax the PDB to allow all disruptions
+				pdbCopy := pdb.DeepCopy()
+
+				// Set maxUnavailable to allow all pods to be unavailable (100%)
+				maxUnavailable := intstr.FromString("100%")
+				pdbCopy.Spec.MaxUnavailable = &maxUnavailable
+				pdbCopy.Spec.MinAvailable = nil
+
+				_, err := d.handle.ClientSet().PolicyV1().PodDisruptionBudgets(pdb.Namespace).Update(ctx, pdbCopy, metav1.UpdateOptions{})
+				if err != nil {
+					logger.Error(err, "failed to modify PDB", "pdb", klog.KObj(pdb))
+				} else {
+					logger.V(1).Info("Successfully modified PDB", "pdb", klog.KObj(pdb), "maxUnavailable", "100%")
+					relaxedCount++
+				}
+			}
+
+		case PDBActionNone:
+			if len(podsOnNode) > 0 {
+				logger.V(2).Info("Skipping PDB action", "pdb", klog.KObj(pdb), "node", node.Name, "reason", reason, "podsOnNode", len(podsOnNode), "totalPods", len(pods))
+			}
+		}
+	}
+
+	if relaxedCount > 0 {
+		logger.V(1).Info("Completed PDB relaxation for single-replica deployments", "node", node.Name, "relaxedCount", relaxedCount)
+	}
+}
+
+// getPodsForPDB returns pods that match the PDB's selector
+func (d *DefaultEvictor) getPodsForPDB(ctx context.Context, pdb *policyv1.PodDisruptionBudget) ([]*v1.Pod, error) {
+	var pods []*v1.Pod
+
+	// If PDB has no selector, it matches nothing in our logic
+	if pdb.Spec.Selector == nil {
+		return pods, nil
+	}
+
+	selector, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse PDB label selector: %w", err)
+	}
+
+	// List pods in the PDB's namespace
+	podList, err := d.handle.ClientSet().CoreV1().Pods(pdb.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector.String(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods for PDB: %w", err)
+	}
+
+	for i := range podList.Items {
+		pods = append(pods, &podList.Items[i])
+	}
+
+	return pods, nil
+}
+
+// isSingleReplicaDeploymentPod checks if a pod belongs to a single-replica deployment
+func (d *DefaultEvictor) isSingleReplicaDeploymentPod(ctx context.Context, pod *v1.Pod) bool {
+	ownerRefs := podutil.OwnerRef(pod)
+	if len(ownerRefs) == 0 {
+		return false
+	}
+
+	for _, ownerRef := range ownerRefs {
+		if ownerRef.Kind == "Deployment" {
+			// Try to get Deployment from API client
+			dep, err := d.handle.ClientSet().AppsV1().Deployments(pod.Namespace).Get(ctx, ownerRef.Name, metav1.GetOptions{})
+			if err == nil && dep != nil && utils.OwnerHasSingleReplica([]metav1.OwnerReference{ownerRef}, dep) {
+				return true
+			}
+		} else if ownerRef.Kind == "StatefulSet" {
+			// Try to get StatefulSet from API client
+			sts, err := d.handle.ClientSet().AppsV1().StatefulSets(pod.Namespace).Get(ctx, ownerRef.Name, metav1.GetOptions{})
+			if err == nil && sts != nil && utils.OwnerHasSingleReplica([]metav1.OwnerReference{ownerRef}, sts) {
+				return true
+			}
+		} else if ownerRef.Kind == "ReplicaSet" {
+			// For ReplicaSets, follow the chain to the owning Deployment
+			rs, err := d.handle.ClientSet().AppsV1().ReplicaSets(pod.Namespace).Get(ctx, ownerRef.Name, metav1.GetOptions{})
+			if err != nil || rs == nil {
+				continue
+			}
+			// Check if ReplicaSet has a Deployment owner
+			for _, rsOwnerRef := range rs.GetOwnerReferences() {
+				if rsOwnerRef.Kind == "Deployment" {
+					dep, err := d.handle.ClientSet().AppsV1().Deployments(pod.Namespace).Get(ctx, rsOwnerRef.Name, metav1.GetOptions{})
+					if err == nil && dep != nil && utils.OwnerHasSingleReplica([]metav1.OwnerReference{rsOwnerRef}, dep) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// shouldModifyInsteadOfDelete determines if a PDB should be MODIFIED instead of DELETED
+// during node drain. This is appropriate for PDBs that:
+// 1. Have minAvailable: 1 with single-replica workloads (overly restrictive)
+// 2. May be auto-recreated by operators if deleted
+// Modification (setting minAvailable to 0) is safer and allows temporary eviction
+func (d *DefaultEvictor) shouldModifyInsteadOfDelete(pdb *policyv1.PodDisruptionBudget) bool {
+	// Check if PDB has minAvailable set to 1 (the most restrictive for single-replica)
+	if pdb.Spec.MinAvailable != nil && pdb.Spec.MinAvailable.IntValue() == 1 {
+		return true
+	}
+
+	// Check for ownerReferences which indicate the PDB is managed by a controller
+	if len(pdb.OwnerReferences) > 0 {
+		return true
+	}
+
 	return false
 }

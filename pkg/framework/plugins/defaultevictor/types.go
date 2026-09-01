@@ -15,7 +15,6 @@ package defaultevictor
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"sigs.k8s.io/descheduler/pkg/api"
 )
 
@@ -40,6 +39,16 @@ type DefaultEvictorArgs struct {
 	// Users can selectively disable certain default protection rules or enable extra ones.
 	PodProtections PodProtections `json:"podProtections,omitempty"`
 
+	// DeletePDBsForSingleReplicaDeployments when true, deletes all PodDisruptionBudgets
+	// that protect pods from single-replica deployments, allowing descheduler to evict them.
+	DeletePDBsForSingleReplicaDeployments bool `json:"deletePDBsForSingleReplicaDeployments,omitempty"`
+
+	// DeletePDBsForUnderreplicatedDeployments when true, deletes PodDisruptionBudgets for
+	// deployments that are significantly under-replicated or concentrated on a single node.
+	// This helps descheduler complete node drains when PDBs prevent eviction of critical
+	// infrastructure components like istio ingress gateways.
+	DeletePDBsForUnderreplicatedDeployments bool `json:"deletePDBsForUnderreplicatedDeployments,omitempty"`
+
 	// Deprecated: Use DisabledDefaultPodProtection with "PodsWithLocalStorage" instead.
 	EvictLocalStoragePods bool `json:"evictLocalStoragePods,omitempty"`
 	// Deprecated: Use DisabledDefaultPodProtection with "DaemonSetPods" instead.
@@ -58,14 +67,13 @@ type DefaultEvictorArgs struct {
 type PodProtection string
 
 const (
-	PodsWithLocalStorage                  PodProtection = "PodsWithLocalStorage"
-	DaemonSetPods                         PodProtection = "DaemonSetPods"
-	SystemCriticalPods                    PodProtection = "SystemCriticalPods"
-	FailedBarePods                        PodProtection = "FailedBarePods"
-	PodsWithPVC                           PodProtection = "PodsWithPVC"
-	PodsWithoutPDB                        PodProtection = "PodsWithoutPDB"
-	PodsWithResourceClaims                PodProtection = "PodsWithResourceClaims"
-	PodsWithPDBBlockingSingleReplicaOwner PodProtection = "PodsWithPDBBlockingSingleReplicaOwner"
+	PodsWithLocalStorage   PodProtection = "PodsWithLocalStorage"
+	DaemonSetPods          PodProtection = "DaemonSetPods"
+	SystemCriticalPods     PodProtection = "SystemCriticalPods"
+	FailedBarePods         PodProtection = "FailedBarePods"
+	PodsWithPVC            PodProtection = "PodsWithPVC"
+	PodsWithoutPDB         PodProtection = "PodsWithoutPDB"
+	PodsWithResourceClaims PodProtection = "PodsWithResourceClaims"
 )
 
 // PodProtections holds the list of enabled and disabled protection policies.
@@ -135,12 +143,10 @@ var defaultPodProtections = []PodProtection{
 //   - PodsWithPVC: Protects pods using PersistentVolumeClaims.
 //   - PodsWithoutPDB: Protects pods lacking a PodDisruptionBudget.
 //   - PodsWithResourceClaims: Protects pods using ResourceClaims.
-//   - PodsWithPDBBlockingSingleReplicaOwner: Allow eviction of pods with PDBs when their owner has only 1 replica (bypasses PDB protection).
 var extraPodProtections = []PodProtection{
 	PodsWithPVC,
 	PodsWithoutPDB,
 	PodsWithResourceClaims,
-	PodsWithPDBBlockingSingleReplicaOwner,
 }
 
 // NoEvictionPolicy dictates whether a no-eviction policy is preferred or mandatory.
