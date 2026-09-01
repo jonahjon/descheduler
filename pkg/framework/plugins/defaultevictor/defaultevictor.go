@@ -504,13 +504,28 @@ func (d *DefaultEvictor) Name() string {
 func (d *DefaultEvictor) PreEvictionFilter(pod *v1.Pod) bool {
 	logger := d.logger.WithValues("ExtensionPoint", frameworktypes.PreEvictionFilterExtensionPoint)
 	if d.args.NodeFit {
+		// Skip nodeFit check for pods in excluded namespaces
+		if d.isNamespaceExcludedFromNodeFit(pod.Namespace) {
+			logger.V(3).Info("pod is in excluded namespace, skipping nodeFit check", "pod", klog.KObj(pod), "namespace", pod.Namespace)
+			return true
+		}
+
+		// Skip nodeFit check for pods matching the label selector (they are exempt from fit checking)
+		if d.args.LabelSelector != nil {
+			selector, err := metav1.LabelSelectorAsSelector(d.args.LabelSelector)
+			if err == nil && selector.Matches(labels.Set(pod.Labels)) {
+				logger.V(3).Info("pod matches nodeFit exemption label selector, skipping nodeFit check", "pod", klog.KObj(pod))
+				return true
+			}
+		}
+
 		nodes, err := nodeutil.ReadyNodes(context.TODO(), d.handle.ClientSet(), d.handle.SharedInformerFactory().Core().V1().Nodes().Lister(), d.args.NodeSelector)
 		if err != nil {
 			logger.Error(err, "unable to list ready nodes", "pod", klog.KObj(pod))
 			return false
 		}
 		if !nodeutil.PodFitsAnyOtherNode(d.handle.GetPodsAssignedToNodeFunc(), pod, nodes) {
-			logger.Info("pod does not fit on any other node because of nodeSelector(s), Taint(s), or nodes marked as unschedulable", "pod", klog.KObj(pod))
+			logger.V(3).Info("pod does not fit on any other node because of nodeSelector(s), Taint(s), or nodes marked as unschedulable", "pod", klog.KObj(pod))
 			return false
 		}
 	}
@@ -593,4 +608,17 @@ func getPodIndexerByOwnerRefs(indexName string, handle frameworktypes.Handle) (c
 		return nil, err
 	}
 	return indexer, nil
+}
+
+// isNamespaceExcludedFromNodeFit checks if a namespace is in the nodeFitExcludedNamespaces list
+func (d *DefaultEvictor) isNamespaceExcludedFromNodeFit(namespace string) bool {
+	if len(d.args.NodeFitExcludedNamespaces) == 0 {
+		return false
+	}
+	for _, excludedNs := range d.args.NodeFitExcludedNamespaces {
+		if excludedNs == namespace {
+			return true
+		}
+	}
+	return false
 }
