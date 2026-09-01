@@ -162,9 +162,32 @@ func usageToKeysAndValues(usage api.ReferencedResourceList) []any {
 	return keysAndValues
 }
 
+// asDefaultEvictor returns the profile's DefaultEvictor instance, or nil when the
+// profile is not using one.
+func asDefaultEvictor(handle frameworktypes.Handle) *defaultevictor.DefaultEvictor {
+	evictorPlugin := handle.EvictorPlugin()
+	if evictorPlugin == nil {
+		return nil
+	}
+	defaultEvictor, ok := evictorPlugin.(*defaultevictor.DefaultEvictor)
+	if !ok {
+		return nil
+	}
+	return defaultEvictor
+}
+
 // uncordonNodeIfNeeded uncordons a node if it was cordoned by descheduler or is already unschedulable.
 // It logs the reason for uncordoning and returns any error from the uncordon operation.
 func uncordonNodeIfNeeded(ctx context.Context, node *v1.Node, logger klog.Logger, handle frameworktypes.Handle, nodesCordoned, nodeWasAlreadyUnschedulable map[string]bool, reason string) error {
+	// The drain of this node is over, however it ended, so any PodDisruptionBudget
+	// that was relaxed to let it proceed gets its original settings back. This
+	// runs before the uncordon and regardless of who cordoned the node: leaving a
+	// budget wide open is worse than leaving a node unschedulable, and it is a
+	// no-op when nothing was relaxed.
+	if defaultEvictor := asDefaultEvictor(handle); defaultEvictor != nil {
+		defaultEvictor.RestorePDBsForNode(ctx, node, logger)
+	}
+
 	if nodesCordoned[node.Name] || nodeWasAlreadyUnschedulable[node.Name] {
 		logger.V(1).Info("Uncordoning node", "node", klog.KObj(node), "reason", reason)
 		if uncordonErr := nodeutil.UncordonNode(ctx, handle.ClientSet(), node); uncordonErr != nil {
@@ -230,11 +253,9 @@ func evictPodsFromSourceNodes(
 		}
 		nodesCordoned[node.node.Name] = true
 
-		// Delete/modify PDBs BEFORE classifying pods to ensure the pod filter sees updated PDB state
-		if evictorPlugin := handle.EvictorPlugin(); evictorPlugin != nil {
-			if defaultEvictor, ok := evictorPlugin.(*defaultevictor.DefaultEvictor); ok {
-				defaultEvictor.DeletePDBsForNode(ctx, node.node, logger)
-			}
+		// Relax PDBs BEFORE classifying pods to ensure the pod filter sees updated PDB state
+		if defaultEvictor := asDefaultEvictor(handle); defaultEvictor != nil {
+			defaultEvictor.RelaxPDBsForNode(ctx, node.node, logger)
 		}
 
 		nonRemovablePods, removablePods := classifyPods(node.allPods, podFilter)
